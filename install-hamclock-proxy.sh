@@ -2,24 +2,41 @@
 # =============================================================================
 #  OHB Lite Proxy — Installer
 #  Proxies clearskyinstitute.com, overrides /esats/esats.txt with local copy
+#  Fetches TLE data and rebuilds esats.txt every 6 hours via systemd timer
 # =============================================================================
 
 set -e
 
 # ── Config ────────────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/hamclock-proxy"
+BACKEND_DIR="/opt/hamclock-backend"
+ESATS_DIR="${BACKEND_DIR}/htdocs/ham/HamClock/esats"
+SCRIPTS_DIR="${BACKEND_DIR}/scripts"
+
 SERVICE_NAME="hamclock-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+REFRESH_SERVICE_NAME="hamclock-esats-refresh"
+REFRESH_SERVICE_FILE="/etc/systemd/system/${REFRESH_SERVICE_NAME}.service"
+REFRESH_TIMER_FILE="/etc/systemd/system/${REFRESH_SERVICE_NAME}.timer"
+REFRESH_SCRIPT="${INSTALL_DIR}/refresh_esats.sh"
+
 PROXY_PORT=8083
 PROXY_SCRIPT="${INSTALL_DIR}/proxy.py"
-ESATS_FILE="${INSTALL_DIR}/esats.txt"
+
+# The canonical esats.txt lives in the backend tree; the proxy symlinks to it
+BACKEND_ESATS="${ESATS_DIR}/esats.txt"
+BACKEND_ESATS1="${ESATS_DIR}/esats1.txt"
+PROXY_ESATS_LINK="${INSTALL_DIR}/esats.txt"
+
 UPSTREAM="http://clearskyinstitute.com"
+REPO_URL="https://github.com/BrianWilkinsFL/open-hamclock-backend"
 VERSION="1.0.0"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m';     LRED='\033[1;31m'
 GREEN='\033[0;32m';   LGREEN='\033[1;32m'
-YELLOW='\033[1;33m';
+YELLOW='\033[1;33m'
 CYAN='\033[0;36m';    LCYAN='\033[1;36m'
 WHITE='\033[1;37m'
 BOLD='\033[1m';       DIM='\033[2m'
@@ -63,8 +80,7 @@ stop_spinner() {
 }
 
 # ── Progress bar ──────────────────────────────────────────────────────────────
-# Usage: progress_bar <current> <total> <label>
-TOTAL_STEPS=9
+TOTAL_STEPS=18
 CURRENT_STEP=0
 
 advance() {
@@ -128,9 +144,13 @@ print_logo() {
 print_logo
 
 echo -e "  ${BOLD}Configuration${NC}"
-echo -e "  ${DIM}  Install dir  :${NC} ${WHITE}${INSTALL_DIR}${NC}"
-echo -e "  ${DIM}  Listen port  :${NC} ${WHITE}${PROXY_PORT}${NC}"
-echo -e "  ${DIM}  Upstream     :${NC} ${WHITE}${UPSTREAM}${NC}"
+echo -e "  ${DIM}  Proxy install dir  :${NC} ${WHITE}${INSTALL_DIR}${NC}"
+echo -e "  ${DIM}  Backend dir        :${NC} ${WHITE}${BACKEND_DIR}${NC}"
+echo -e "  ${DIM}  esats output       :${NC} ${WHITE}${BACKEND_ESATS}${NC}"
+echo -e "  ${DIM}  Proxy symlink      :${NC} ${WHITE}${PROXY_ESATS_LINK}${NC}"
+echo -e "  ${DIM}  Listen port        :${NC} ${WHITE}${PROXY_PORT}${NC}"
+echo -e "  ${DIM}  Upstream           :${NC} ${WHITE}${UPSTREAM}${NC}"
+echo -e "  ${DIM}  Refresh schedule   :${NC} ${WHITE}Every 6 hours${NC}"
 echo
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
@@ -138,20 +158,26 @@ section "Preflight Checks"
 
 start_spinner "Checking root privileges"
 sleep 0.3
-if [[ $EUID -ne 0 ]]; then stop_spinner 1; error "Please run as root: sudo $0"; fi
+[[ $EUID -ne 0 ]] && { stop_spinner 1; error "Please run as root: sudo $0"; }
 stop_spinner 0
 advance "Root check passed"
 
 start_spinner "Locating python3"
 sleep 0.3
-if ! python3 --version &>/dev/null; then stop_spinner 1; error "python3 not found — install with: sudo apt install python3"; fi
+python3 --version &>/dev/null || { stop_spinner 1; error "python3 not found — sudo apt install python3"; }
 PYTHON_VER=$(python3 --version 2>&1)
 stop_spinner 0
 advance "${PYTHON_VER} found"
 
+start_spinner "Locating perl"
+sleep 0.3
+perl --version &>/dev/null || { stop_spinner 1; error "perl not found — sudo apt install perl"; }
+stop_spinner 0
+advance "perl found"
+
 start_spinner "Verifying systemd"
 sleep 0.3
-if ! systemctl --version &>/dev/null; then stop_spinner 1; error "systemd not found on this system."; fi
+systemctl --version &>/dev/null || { stop_spinner 1; error "systemd not found."; }
 stop_spinner 0
 advance "systemd present"
 
@@ -165,23 +191,149 @@ else
 fi
 advance "Port ${PROXY_PORT} checked"
 
-# ── Prepare environment ───────────────────────────────────────────────────────
-section "Preparing Environment"
+# ── Prepare directories ────────────────────────────────────────────────────────
+section "Preparing Directories"
 
-start_spinner "Stopping existing service (if running)"
-if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-fi
+start_spinner "Stopping existing services (if running)"
+for svc in "${SERVICE_NAME}" "${REFRESH_SERVICE_NAME}"; do
+    if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+        systemctl stop "${svc}" 2>/dev/null || true
+    fi
+done
 sleep 0.4
 stop_spinner 0
 
-start_spinner "Creating install directory  ${INSTALL_DIR}"
+start_spinner "Creating proxy directory  ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
-sleep 0.3
+sleep 0.2
 stop_spinner 0
-advance "Environment ready"
 
-# ── Write proxy.py ────────────────────────────────────────────────────────────
+start_spinner "Creating backend scripts directory  ${SCRIPTS_DIR}"
+mkdir -p "${SCRIPTS_DIR}"
+sleep 0.2
+stop_spinner 0
+
+start_spinner "Creating esats output directory  ${ESATS_DIR}"
+mkdir -p "${ESATS_DIR}"
+sleep 0.2
+stop_spinner 0
+advance "Directories ready"
+
+# ── Clone / update backend scripts ────────────────────────────────────────────
+section "Fetching Backend Scripts"
+
+start_spinner "Checking for git"
+HAS_GIT=0
+git --version &>/dev/null && HAS_GIT=1
+sleep 0.2
+stop_spinner 0
+
+if [[ $HAS_GIT -eq 1 ]]; then
+    start_spinner "Sparse-cloning 3 files from open-hamclock-backend"
+    TMP_CLONE=$(mktemp -d)
+    (
+        cd "${TMP_CLONE}"
+        git clone --quiet --no-checkout --depth=1 --filter=blob:none \
+            "${REPO_URL}" repo
+        cd repo
+        git sparse-checkout init --cone
+        git sparse-checkout set scripts ham/HamClock/esats
+        git checkout --quiet main
+    )
+
+    # Copy the two scripts
+    cp "${TMP_CLONE}/repo/scripts/fetch_tle.sh"   "${SCRIPTS_DIR}/fetch_tle.sh"
+    cp "${TMP_CLONE}/repo/scripts/build_esats.pl" "${SCRIPTS_DIR}/build_esats.pl"
+
+    # Copy esats1.txt — only if not already present (preserve any live version)
+    if [[ ! -f "${BACKEND_ESATS1}" ]]; then
+        cp "${TMP_CLONE}/repo/ham/HamClock/esats/esats1.txt" "${BACKEND_ESATS1}"
+    fi
+
+    rm -rf "${TMP_CLONE}"
+    stop_spinner 0
+else
+    stop_spinner 0
+    warn "git not found — skipping auto-clone. Manually copy into ${SCRIPTS_DIR}/:"
+    warn "  fetch_tle.sh, build_esats.pl"
+    warn "And copy ham/HamClock/esats/esats1.txt from the repo to ${BACKEND_ESATS1}"
+fi
+advance "Backend scripts ready"
+
+# Make scripts executable
+chmod +x "${SCRIPTS_DIR}/fetch_tle.sh"
+chmod +x "${SCRIPTS_DIR}/build_esats.pl"
+
+start_spinner "Verifying esats1.txt baseline"
+sleep 0.2
+[[ -f "${BACKEND_ESATS1}" ]] && stop_spinner 0 || { stop_spinner 1; warn "esats1.txt missing — refresh may fail on first run."; }
+advance "esats1.txt ready"
+
+# ── Create placeholder esats.txt if nothing there yet ─────────────────────────
+if [[ ! -f "${BACKEND_ESATS}" ]]; then
+    cp "${BACKEND_ESATS1}" "${BACKEND_ESATS}" 2>/dev/null || touch "${BACKEND_ESATS}"
+fi
+
+# ── Symlink backend esats.txt → proxy dir ─────────────────────────────────────
+start_spinner "Symlinking  ${BACKEND_ESATS}  →  ${PROXY_ESATS_LINK}"
+# Remove any old plain file or stale symlink at the proxy location
+rm -f "${PROXY_ESATS_LINK}"
+ln -s "${BACKEND_ESATS}" "${PROXY_ESATS_LINK}"
+sleep 0.2
+stop_spinner 0
+advance "Symlink created"
+
+# ── Write the refresh wrapper script ─────────────────────────────────────────
+section "Installing Refresh Scripts"
+
+start_spinner "Writing refresh_esats.sh"
+cat > "${REFRESH_SCRIPT}" << REFRESHEOF
+#!/bin/bash
+# =============================================================================
+#  OHB Lite Proxy — esats refresh script
+#  Runs fetch_tle.sh then build_esats.pl every 6 hours via systemd timer
+# =============================================================================
+
+set -euo pipefail
+umask 022   # ensure all written files are world-readable (proxy runs as nobody)
+
+SCRIPTS_DIR="${SCRIPTS_DIR}"
+ESATS_DIR="${ESATS_DIR}"
+LOG_TAG="ohb-esats-refresh"
+
+log()  { echo "\$(date '+%Y-%m-%d %H:%M:%S') INFO  \$*"; }
+err()  { echo "\$(date '+%Y-%m-%d %H:%M:%S') ERROR \$*" >&2; }
+
+log "=== OHB esats refresh starting ==="
+
+# ── Step 1: Fetch fresh TLE data ─────────────────────────────────────────────
+log "Running fetch_tle.sh ..."
+if bash "\${SCRIPTS_DIR}/fetch_tle.sh"; then
+    log "fetch_tle.sh completed successfully."
+else
+    err "fetch_tle.sh failed — aborting refresh."
+    exit 1
+fi
+
+# ── Step 2: Build esats.txt from TLE data ────────────────────────────────────
+log "Running build_esats.pl ..."
+if ESATS_OUT="${ESATS_DIR}/esats.txt" \
+   ESATS_ORIGINAL="${ESATS_DIR}/esats1.txt" \
+   perl "\${SCRIPTS_DIR}/build_esats.pl"; then
+    log "build_esats.pl completed successfully."
+else
+    err "build_esats.pl failed — previous esats.txt retained."
+    exit 1
+fi
+
+log "=== esats refresh complete — $(wc -l < "${ESATS_DIR}/esats.txt") lines in esats.txt ==="
+REFRESHEOF
+
+chmod +x "${REFRESH_SCRIPT}"
+stop_spinner 0
+advance "refresh_esats.sh written"
+
+# ── Write proxy.py ─────────────────────────────────────────────────────────────
 section "Installing Proxy Engine"
 
 start_spinner "Writing proxy.py"
@@ -192,6 +344,8 @@ OHB Lite Proxy
 --------------
 Transparently proxies requests to clearskyinstitute.com.
 Paths listed in LOCAL_OVERRIDES are served from local files instead.
+The esats.txt entry points at a symlink that is refreshed every 6 hours
+by the hamclock-esats-refresh systemd timer.
 """
 
 import http.server
@@ -206,7 +360,7 @@ UPSTREAM        = "@@UPSTREAM@@"
 LISTEN_HOST     = "0.0.0.0"
 LISTEN_PORT     = @@PORT@@
 LOCAL_OVERRIDES = {
-    "/esats/esats.txt": "@@ESATS_FILE@@",
+    "/ham/HamClock/esats/esats.txt": "@@PROXY_ESATS_LINK@@",
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -235,10 +389,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # ── Local override? ───────────────────────────────────────────────────
         if path in LOCAL_OVERRIDES:
             local_path = LOCAL_OVERRIDES[path]
-            if os.path.isfile(local_path):
-                log.info("OVERRIDE  %s  ->  %s", path, local_path)
+            resolved = os.path.realpath(local_path)
+            if os.path.isfile(resolved):
+                log.info("OVERRIDE  %s  ->  %s  (resolved: %s)", path, local_path, resolved)
                 try:
-                    with open(local_path, "rb") as fh:
+                    with open(resolved, "rb") as fh:
                         data = fh.read()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -249,9 +404,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(data)
                     return
                 except OSError as exc:
-                    log.error("Cannot read local file %s: %s", local_path, exc)
+                    log.error("Cannot read local file %s: %s", resolved, exc)
             else:
-                log.warning("Override file missing (%s), falling through to upstream", local_path)
+                log.warning("Override target missing or broken symlink (%s -> %s), "
+                            "falling through to upstream", local_path, resolved)
 
         # ── Proxy to upstream ─────────────────────────────────────────────────
         url = UPSTREAM + path
@@ -290,7 +446,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, fmt, *args):
-        pass  # We use our own structured logging
+        pass
 
 
 if __name__ == "__main__":
@@ -306,38 +462,20 @@ if __name__ == "__main__":
         server.server_close()
 PYEOF
 
-sed -i "s|@@UPSTREAM@@|${UPSTREAM}|g"     "${PROXY_SCRIPT}"
-sed -i "s|@@PORT@@|${PROXY_PORT}|g"       "${PROXY_SCRIPT}"
-sed -i "s|@@ESATS_FILE@@|${ESATS_FILE}|g" "${PROXY_SCRIPT}"
+sed -i "s|@@UPSTREAM@@|${UPSTREAM}|g"           "${PROXY_SCRIPT}"
+sed -i "s|@@PORT@@|${PROXY_PORT}|g"             "${PROXY_SCRIPT}"
+sed -i "s|@@PROXY_ESATS_LINK@@|${PROXY_ESATS_LINK}|g" "${PROXY_SCRIPT}"
 chmod +x "${PROXY_SCRIPT}"
 stop_spinner 0
 advance "proxy.py written & configured"
 
-# ── esats.txt ─────────────────────────────────────────────────────────────────
-start_spinner "Setting up local esats.txt override"
-if [[ ! -f "${ESATS_FILE}" ]]; then
-    cat > "${ESATS_FILE}" << 'ESEOF'
-# OHB Lite Proxy — local esats.txt override
-# Replace this file with your custom satellite element data.
-# Format matches the clearskyinstitute.com /esats/esats.txt file.
-ESEOF
-    sleep 0.3
-    stop_spinner 0
-    warn "Placeholder created — edit ${ESATS_FILE} with real satellite data."
-else
-    sleep 0.3
-    stop_spinner 0
-fi
-advance "esats.txt override ready"
+# ── systemd: proxy service ─────────────────────────────────────────────────────
+section "Registering System Services"
 
-# ── systemd service ───────────────────────────────────────────────────────────
-section "Registering System Service"
-
-start_spinner "Writing systemd unit file"
+start_spinner "Writing proxy systemd unit"
 cat > "${SERVICE_FILE}" << SVCEOF
 [Unit]
 Description=OHB Lite Proxy (clearskyinstitute.com)
-Documentation=https://www.clearskyinstitute.com/ham/HamClock/
 After=network-online.target
 Wants=network-online.target
 
@@ -352,48 +490,127 @@ StandardError=journal
 SyslogIdentifier=${SERVICE_NAME}
 User=nobody
 Group=nogroup
-ReadOnlyPaths=${INSTALL_DIR}
+ReadOnlyPaths=${INSTALL_DIR} ${ESATS_DIR}
 NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-sleep 0.3
+sleep 0.2
+stop_spinner 0
+advance "Proxy service unit written"
+
+# ── systemd: refresh oneshot service ─────────────────────────────────────────
+start_spinner "Writing esats refresh service unit"
+cat > "${REFRESH_SERVICE_FILE}" << RSVCEOF
+[Unit]
+Description=OHB Lite Proxy — Refresh esats.txt from TLE data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${REFRESH_SCRIPT}
+WorkingDirectory=${BACKEND_DIR}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${REFRESH_SERVICE_NAME}
+# Run as root so scripts can write to backend dirs
+# (tighten this if your scripts run as a dedicated user)
+User=root
+
+[Install]
+WantedBy=multi-user.target
+RSVCEOF
+sleep 0.2
 stop_spinner 0
 
+# ── systemd: 6-hour timer ─────────────────────────────────────────────────────
+start_spinner "Writing 6-hour refresh timer"
+cat > "${REFRESH_TIMER_FILE}" << TIMEREOF
+[Unit]
+Description=OHB Lite Proxy — Refresh esats every 6 hours
+Requires=${REFRESH_SERVICE_NAME}.service
+
+[Timer]
+# Run 2 minutes after boot, then every 6 hours
+OnBootSec=2min
+OnUnitActiveSec=6h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+sleep 0.2
+stop_spinner 0
+advance "Timer unit written"
+
+# ── Permissions ───────────────────────────────────────────────────────────────
 start_spinner "Setting file permissions"
 chown -R nobody:nogroup "${INSTALL_DIR}"
 chmod 755 "${INSTALL_DIR}"
-chmod 644 "${ESATS_FILE}"
 chmod 755 "${PROXY_SCRIPT}"
+# Backend dirs need to be writable by root (refresh runs as root)
+chown -R root:root "${BACKEND_DIR}"
+chmod 755 "${ESATS_DIR}"
+chmod 644 "${BACKEND_ESATS}" 2>/dev/null || true
+chmod 644 "${BACKEND_ESATS1}" 2>/dev/null || true
+# Symlink itself inherits permissions from target; readable by nobody
 sleep 0.3
 stop_spinner 0
+advance "Permissions set"
 
+# ── Enable and start everything ────────────────────────────────────────────────
 start_spinner "Reloading systemd daemon"
 systemctl daemon-reload
 sleep 0.4
 stop_spinner 0
 
-start_spinner "Enabling service at boot"
+start_spinner "Enabling proxy service"
 systemctl enable "${SERVICE_NAME}" &>/dev/null
-sleep 0.3
+sleep 0.2
 stop_spinner 0
 
-start_spinner "Starting OHB Lite Proxy"
+start_spinner "Enabling esats refresh timer"
+systemctl enable "${REFRESH_SERVICE_NAME}.timer" &>/dev/null
+sleep 0.2
+stop_spinner 0
+
+start_spinner "Starting proxy service"
 systemctl restart "${SERVICE_NAME}"
 sleep 2
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
     stop_spinner 0
 else
     stop_spinner 1
-    error "Service failed to start.\nCheck logs with: journalctl -u ${SERVICE_NAME} -n 50"
+    error "Proxy service failed to start.\nCheck: journalctl -u ${SERVICE_NAME} -n 50"
 fi
-advance "Service running"
+advance "Proxy service running"
 
-# ── Final 100% progress flush ─────────────────────────────────────────────────
+start_spinner "Starting esats refresh timer"
+systemctl start "${REFRESH_SERVICE_NAME}.timer"
+sleep 0.5
+stop_spinner 0
+advance "Refresh timer running"
+
+start_spinner "Running initial esats refresh now"
+# Run the refresh service immediately so esats.txt is populated right away
+if systemctl start "${REFRESH_SERVICE_NAME}.service" 2>/dev/null; then
+    # Wait up to 30s for the oneshot to complete
+    timeout 30 systemctl is-active --quiet "${REFRESH_SERVICE_NAME}.service" 2>/dev/null || true
+    sleep 2
+    stop_spinner 0
+else
+    stop_spinner 1
+    warn "Initial refresh did not complete — will retry at next timer tick (within 6h)."
+    warn "Run manually: sudo systemctl start ${REFRESH_SERVICE_NAME}.service"
+fi
+advance "Initial esats populated"
+
+# ── Final 100% bar ────────────────────────────────────────────────────────────
 echo
-# Draw the completed bar one final time at 100%
 width=40
 bar="${LGREEN}"
 for (( i=0; i<width; i++ )); do bar+="█"; done
@@ -403,6 +620,10 @@ sleep 0.2
 
 # ── Detect local IP ───────────────────────────────────────────────────────────
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+# ── Next timer tick ───────────────────────────────────────────────────────────
+NEXT_TIMER=$(systemctl list-timers "${REFRESH_SERVICE_NAME}.timer" --no-pager 2>/dev/null \
+    | awk 'NR==2 {print $1, $2}' || echo "unknown")
 
 # ── Done banner ───────────────────────────────────────────────────────────────
 echo
@@ -417,15 +638,24 @@ else
     echo -e "    ${WHITE}hamclock ${LCYAN}-b <raspberry-pi-ip>:${PROXY_PORT}${NC}"
 fi
 echo
-echo -e "  ${BOLD}Local esats.txt override:${NC}"
-echo -e "    ${DIM}${ESATS_FILE}${NC}"
+echo -e "  ${BOLD}esats.txt data flow:${NC}"
+echo -e "    ${DIM}fetch_tle.sh → build_esats.pl → ${BACKEND_ESATS}${NC}"
+echo -e "    ${DIM}               symlink ↑${NC}"
+echo -e "    ${DIM}             ${PROXY_ESATS_LINK}${NC}"
+echo -e "    ${DIM}               served ↑ by proxy on /esats/esats.txt${NC}"
+echo
+echo -e "  ${BOLD}Refresh schedule:${NC}  every 6 hours  ${DIM}(next: ${NEXT_TIMER})${NC}"
 echo
 echo -e "  ${BOLD}Useful commands:${NC}"
-echo -e "    ${DIM}Status   :${NC}  sudo systemctl status ${SERVICE_NAME}"
-echo -e "    ${DIM}Logs     :${NC}  sudo journalctl -u ${SERVICE_NAME} -f"
-echo -e "    ${DIM}Restart  :${NC}  sudo systemctl restart ${SERVICE_NAME}"
-echo -e "    ${DIM}Stop     :${NC}  sudo systemctl stop ${SERVICE_NAME}"
-echo -e "    ${DIM}Uninstall:${NC}  sudo systemctl disable --now ${SERVICE_NAME}"
-echo -e "             ${DIM}sudo rm -f ${SERVICE_FILE}${NC}"
-echo -e "             ${DIM}sudo rm -rf ${INSTALL_DIR}${NC}"
+echo -e "    ${DIM}Proxy status   :${NC}  sudo systemctl status ${SERVICE_NAME}"
+echo -e "    ${DIM}Proxy logs     :${NC}  sudo journalctl -u ${SERVICE_NAME} -f"
+echo -e "    ${DIM}Refresh logs   :${NC}  sudo journalctl -u ${REFRESH_SERVICE_NAME} -f"
+echo -e "    ${DIM}Force refresh  :${NC}  sudo systemctl start ${REFRESH_SERVICE_NAME}.service"
+echo -e "    ${DIM}Timer status   :${NC}  sudo systemctl list-timers ${REFRESH_SERVICE_NAME}.timer"
+echo -e "    ${DIM}Restart proxy  :${NC}  sudo systemctl restart ${SERVICE_NAME}"
+echo
+echo -e "  ${BOLD}Uninstall:${NC}"
+echo -e "    ${DIM}sudo systemctl disable --now ${SERVICE_NAME} ${REFRESH_SERVICE_NAME}.timer${NC}"
+echo -e "    ${DIM}sudo rm -f ${SERVICE_FILE} ${REFRESH_SERVICE_FILE} ${REFRESH_TIMER_FILE}${NC}"
+echo -e "    ${DIM}sudo rm -rf ${INSTALL_DIR}${NC}"
 echo
