@@ -47,19 +47,6 @@ hamclock -b <pi-ip-address>:8083
 
 ---
 
-## 🛰️ Customising esats.txt
-
-Edit the local override file to serve your own satellite elements:
-
-```bash
-sudo nano /opt/hamclock-proxy/esats.txt
-sudo systemctl restart hamclock-proxy
-```
-
-Format matches the upstream `clearskyinstitute.com/esats/esats.txt` file.
-
----
-
 ## 🛠️ Service Management
 
 ```bash
