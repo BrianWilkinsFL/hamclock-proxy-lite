@@ -12,7 +12,7 @@ import sys
 
 UPSTREAM = "http://clearskyinstitute.com"
 LOCAL_OVERRIDES = {
-    "/esats/esats.txt": "/opt/hamclock-proxy/esats.txt",
+    "/ham/HamClock/esats/esats.txt": "/opt/hamclock-proxy/esats.txt",
 }
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8083
